@@ -4,10 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
-	"slices"
 
-	batchv1 "k8s.io/api/batch/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
@@ -66,6 +63,11 @@ func (r *Reconciler) handleResetAnnotation(ctx context.Context, talosUpgrade *tu
 		return false, err
 	}
 
+	prevPhase := talosUpgrade.Status.Phase
+	totalNodes, err := r.getTotalNodeCount(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to get total node count for metrics")
+	}
 	if err := r.updateStatus(ctx, talosUpgrade, map[string]any{
 		"phase":          tupprv1alpha1.JobPhasePending,
 		"currentNode":    "",
@@ -76,6 +78,9 @@ func (r *Reconciler) handleResetAnnotation(ctx context.Context, talosUpgrade *tu
 		logger.Error(err, "Failed to reset status after annotation")
 		return false, err
 	}
+	talosUpgrade.Status.Phase = tupprv1alpha1.JobPhasePending
+	r.recordPhaseTransition(talosUpgrade, prevPhase, tupprv1alpha1.JobPhasePending)
+	r.MetricsReporter.RecordTalosUpgradeNodes(talosUpgrade.Name, totalNodes, 0, 0)
 
 	return true, nil
 }
@@ -90,40 +95,22 @@ func (r *Reconciler) handleGenerationChange(ctx context.Context, talosUpgrade *t
 		"generation", talosUpgrade.Generation,
 		"observed", talosUpgrade.Status.ObservedGeneration)
 
-	return true, r.updateStatus(ctx, talosUpgrade, map[string]any{
+	prevPhase := talosUpgrade.Status.Phase
+	totalNodes, err := r.getTotalNodeCount(ctx)
+	if err != nil {
+		logger.Error(err, "Failed to get total node count for metrics")
+	}
+	if err := r.updateStatus(ctx, talosUpgrade, map[string]any{
 		"phase":          tupprv1alpha1.JobPhasePending,
 		"currentNode":    "",
 		"message":        "Spec updated, restarting upgrade process",
 		"completedNodes": []string{},
 		"failedNodes":    []tupprv1alpha1.NodeUpgradeStatus{},
-	})
-}
-
-func (r *Reconciler) findActiveJob(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade) (*batchv1.Job, string, error) {
-	jobList := &batchv1.JobList{}
-	if err := r.List(ctx, jobList,
-		client.InNamespace(r.ControllerNamespace),
-		client.MatchingLabels{
-			"app.kubernetes.io/name": "talos-upgrade",
-		}); err != nil {
-		return nil, "", err
+	}); err != nil {
+		return false, err
 	}
-
-	for _, job := range jobList.Items {
-		nodeName := job.Labels["tuppr.home-operations.com/target-node"]
-
-		if slices.Contains(talosUpgrade.Status.CompletedNodes, nodeName) {
-			continue
-		}
-
-		if slices.ContainsFunc(talosUpgrade.Status.FailedNodes, func(n tupprv1alpha1.NodeUpgradeStatus) bool {
-			return n.NodeName == nodeName
-		}) {
-			continue
-		}
-
-		return &job, nodeName, nil
-	}
-
-	return nil, "", nil
+	talosUpgrade.Status.Phase = tupprv1alpha1.JobPhasePending
+	r.recordPhaseTransition(talosUpgrade, prevPhase, tupprv1alpha1.JobPhasePending)
+	r.MetricsReporter.RecordTalosUpgradeNodes(talosUpgrade.Name, totalNodes, 0, 0)
+	return true, nil
 }

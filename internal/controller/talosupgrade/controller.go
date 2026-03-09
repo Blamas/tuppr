@@ -17,8 +17,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	tupprv1alpha1 "github.com/home-operations/tuppr/api/v1alpha1"
-	"github.com/home-operations/tuppr/internal/controller/coordination"
-	"github.com/home-operations/tuppr/internal/controller/maintenance"
 	"github.com/home-operations/tuppr/internal/controller/nodeutil"
 	"github.com/home-operations/tuppr/internal/healthcheck"
 	"github.com/home-operations/tuppr/internal/image"
@@ -101,123 +99,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return r.processUpgrade(ctx, &talosUpgrade)
 }
 
-func (r *Reconciler) processUpgrade(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues(
-		"talosupgrade", talosUpgrade.Name,
-		"generation", talosUpgrade.Generation,
-	)
-
-	logger.V(1).Info("Starting upgrade processing")
-
-	now := r.Now.Now()
-
-	if suspended, err := r.handleSuspendAnnotation(ctx, talosUpgrade); err != nil || suspended {
-		return ctrl.Result{RequeueAfter: time.Minute * 30}, err
-	}
-
-	if resetRequested, err := r.handleResetAnnotation(ctx, talosUpgrade); err != nil || resetRequested {
-		return ctrl.Result{RequeueAfter: time.Second * 30}, err
-	}
-
-	if reset, err := r.handleGenerationChange(ctx, talosUpgrade); err != nil || reset {
-		return ctrl.Result{RequeueAfter: time.Second * 30}, err
-	}
-
-	if talosUpgrade.Status.Phase == tupprv1alpha1.JobPhaseCompleted {
-		logger.V(1).Info("Talos upgrade completed, skipping", "phase", talosUpgrade.Status.Phase)
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-	}
-
-	if talosUpgrade.Status.Phase == tupprv1alpha1.JobPhaseFailed {
-		logger.V(1).Info("Talos upgrade failed, skipping", "phase", talosUpgrade.Status.Phase)
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-	}
-
-	if !talosUpgrade.Status.Phase.IsActive() {
-		maintenanceRes, err := maintenance.CheckWindow(talosUpgrade.Spec.Maintenance, now)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: time.Second * 30}, err
-		}
-		if !maintenanceRes.Allowed {
-			requeueAfter := time.Until(*maintenanceRes.NextWindowStart)
-			if requeueAfter > 5*time.Minute {
-				requeueAfter = 5 * time.Minute
-			}
-			nextTimestamp := maintenanceRes.NextWindowStart.Unix()
-			r.MetricsReporter.RecordMaintenanceWindow(metrics.UpgradeTypeTalos, talosUpgrade.Name, false, &nextTimestamp)
-			if err := r.updateStatus(ctx, talosUpgrade, map[string]any{
-				"phase":                 tupprv1alpha1.JobPhaseMaintenanceWindow,
-				"currentNode":           "",
-				"message":               fmt.Sprintf("Waiting for maintenance window (next: %s)", maintenanceRes.NextWindowStart.Format(time.RFC3339)),
-				"nextMaintenanceWindow": metav1.NewTime(*maintenanceRes.NextWindowStart),
-			}); err != nil {
-				logger.Error(err, "Failed to update status for maintenance window")
-			}
-			return ctrl.Result{RequeueAfter: requeueAfter}, nil
-		}
-		r.MetricsReporter.RecordMaintenanceWindow(metrics.UpgradeTypeTalos, talosUpgrade.Name, true, nil)
-	}
-
-	if !talosUpgrade.Status.Phase.IsActive() {
-		if blocked, message, err := coordination.IsAnotherUpgradeActive(ctx, r.Client, talosUpgrade.Name, coordination.UpgradeTypeTalos); err != nil {
-			logger.Error(err, "Failed to check for other active upgrades")
-			return ctrl.Result{RequeueAfter: time.Minute}, nil
-		} else if blocked {
-			logger.Info("Waiting for another upgrade to complete", "reason", message)
-			if err := r.setPhase(ctx, talosUpgrade, tupprv1alpha1.JobPhasePending, "", message); err != nil {
-				logger.Error(err, "Failed to update phase for coordination wait")
-			}
-			return ctrl.Result{RequeueAfter: time.Minute * 2}, nil
-		}
-	}
-
-	if activeJob, activeNode, err := r.findActiveJob(ctx, talosUpgrade); err != nil {
-		logger.Error(err, "Failed to find active jobs")
-		return ctrl.Result{RequeueAfter: time.Minute}, nil
-	} else if activeJob != nil {
-		logger.V(1).Info("Found active job, handling its status", "job", activeJob.Name, "node", activeNode)
-		return r.handleJobStatus(ctx, talosUpgrade, activeNode, activeJob)
-	}
-
-	if len(talosUpgrade.Status.FailedNodes) > 0 {
-		logger.Info("Upgrade stopped due to failed nodes",
-			"failedNodes", len(talosUpgrade.Status.FailedNodes))
-		message := fmt.Sprintf("Upgrade stopped due to %d failed nodes", len(talosUpgrade.Status.FailedNodes))
-		if err := r.setPhase(ctx, talosUpgrade, tupprv1alpha1.JobPhaseFailed, "", message); err != nil {
-			logger.Error(err, "Failed to update phase for failed nodes")
-			return ctrl.Result{RequeueAfter: time.Minute * 5}, err
-		}
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-	}
-
-	return r.processNextNode(ctx, talosUpgrade)
-}
-
-func (r *Reconciler) completeUpgrade(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
-
-	completedCount := len(talosUpgrade.Status.CompletedNodes)
-	failedCount := len(talosUpgrade.Status.FailedNodes)
-
-	var phase tupprv1alpha1.JobPhase
-	var message string
-	if failedCount > 0 {
-		phase = tupprv1alpha1.JobPhaseFailed
-		message = fmt.Sprintf("Completed with failures: %d successful, %d failed", completedCount, failedCount)
-		logger.Info("Upgrade completed with failures", "completed", completedCount, "failed", failedCount)
-	} else {
-		phase = tupprv1alpha1.JobPhaseCompleted
-		message = fmt.Sprintf("Successfully upgraded %d nodes", completedCount)
-		logger.Info("Upgrade completed successfully", "nodes", completedCount)
-	}
-
-	if err := r.setPhase(ctx, talosUpgrade, phase, "", message); err != nil {
-		logger.Error(err, "Failed to update completion phase")
-		return ctrl.Result{RequeueAfter: time.Minute * 5}, err
-	}
-	return ctrl.Result{RequeueAfter: time.Minute * 5}, nil
-}
-
 func (r *Reconciler) cleanup(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 	logger.V(1).Info("Cleaning up TalosUpgrade", "name", talosUpgrade.Name)
@@ -230,6 +111,7 @@ func (r *Reconciler) cleanup(ctx context.Context, talosUpgrade *tupprv1alpha1.Ta
 		return ctrl.Result{}, err
 	}
 
+	r.MetricsReporter.CleanupUpgradeMetrics(metrics.UpgradeTypeTalos, talosUpgrade.Name)
 	logger.V(1).Info("Successfully cleaned up TalosUpgrade", "name", talosUpgrade.Name)
 	return ctrl.Result{}, nil
 }
@@ -279,21 +161,39 @@ func (r *Reconciler) updateStatus(ctx context.Context, talosUpgrade *tupprv1alph
 }
 
 func (r *Reconciler) setPhase(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade, phase tupprv1alpha1.JobPhase, currentNode, message string) error {
-	r.MetricsReporter.RecordTalosUpgradePhase(talosUpgrade.Name, string(phase))
+	prevPhase := talosUpgrade.Status.Phase
 
-	totalNodes, _ := r.getTotalNodeCount(ctx)
+	totalNodes, err := r.getTotalNodeCount(ctx)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "Failed to get total node count for metrics")
+	}
+
+	if err := r.updateStatus(ctx, talosUpgrade, map[string]any{
+		"phase":       phase,
+		"currentNode": currentNode,
+		"message":     message,
+	}); err != nil {
+		return err
+	}
+	talosUpgrade.Status.Phase = phase
+	r.recordPhaseTransition(talosUpgrade, prevPhase, phase)
 	r.MetricsReporter.RecordTalosUpgradeNodes(
 		talosUpgrade.Name,
 		totalNodes,
 		len(talosUpgrade.Status.CompletedNodes),
 		len(talosUpgrade.Status.FailedNodes),
 	)
+	return nil
+}
 
-	return r.updateStatus(ctx, talosUpgrade, map[string]any{
-		"phase":       phase,
-		"currentNode": currentNode,
-		"message":     message,
-	})
+func (r *Reconciler) recordPhaseTransition(talosUpgrade *tupprv1alpha1.TalosUpgrade, fromPhase, toPhase tupprv1alpha1.JobPhase) {
+	r.MetricsReporter.RecordTalosUpgradePhase(talosUpgrade.Name, string(toPhase))
+	if fromPhase != toPhase {
+		if fromPhase != "" {
+			r.MetricsReporter.EndPhaseTiming(metrics.UpgradeTypeTalos, talosUpgrade.Name, string(fromPhase))
+		}
+		r.MetricsReporter.StartPhaseTiming(metrics.UpgradeTypeTalos, talosUpgrade.Name, string(toPhase))
+	}
 }
 
 func (r *Reconciler) addCompletedNode(ctx context.Context, talosUpgrade *tupprv1alpha1.TalosUpgrade, nodeName string) error {
